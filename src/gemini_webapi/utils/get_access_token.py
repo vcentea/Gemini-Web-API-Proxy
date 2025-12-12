@@ -16,8 +16,9 @@ CONSENT_URL_PATTERN = re.compile(r"consent\.google\.com")
 
 
 async def handle_consent_redirect(
+    client: AsyncClient,
+    consent_response: Response,
     cookies: dict,
-    proxy: str | None = None,
     verbose: bool = False
 ) -> tuple[Response | None, dict]:
     """
@@ -28,10 +29,12 @@ async def handle_consent_redirect(
     
     Parameters
     ----------
+    client : AsyncClient
+        The httpx client that already has the consent page loaded.
+    consent_response : Response
+        The response containing the consent page HTML.
     cookies : dict
         Current cookies dict to update with SOCS.
-    proxy : str | None
-        Proxy URL if any.
     verbose : bool
         Whether to log debug information.
         
@@ -40,83 +43,50 @@ async def handle_consent_redirect(
     tuple[Response | None, dict]
         The response after consent and updated cookies with SOCS.
     """
-    # Create a fresh client for consent flow - don't reuse the existing one
-    # as it may have issues with cookie domains
-    async with AsyncClient(
-        proxy=proxy,
-        headers=Headers.GEMINI.value,
-        cookies=cookies,
-        follow_redirects=False,  # Handle redirects manually for better control
-        verify=False,
-    ) as client:
-        # Step 1: Hit Gemini to get redirected to consent page
-        response = await client.get(Endpoint.INIT.value)
-        
-        if response.status_code != 302:
-            if verbose:
-                logger.debug(f"[CONSENT] Expected redirect, got {response.status_code}")
-            return None, cookies
-        
-        consent_url = response.headers.get("location")
-        if not consent_url or "consent.google.com" not in consent_url:
-            if verbose:
-                logger.debug(f"[CONSENT] Not a consent redirect: {consent_url}")
-            return None, cookies
-        
+    consent_html = consent_response.text
+    consent_url = str(consent_response.url)
+    
+    # Extract form data from consent page
+    form_data = {}
+    
+    # Extract hidden input values using regex
+    # Pattern handles both name="x" value="y" and value="y" name="x" orders
+    hidden_inputs = re.findall(
+        r'<input[^>]*type="hidden"[^>]*name="([^"]*)"[^>]*value="([^"]*)"',
+        consent_html
+    )
+    # Also try reverse order
+    hidden_inputs += re.findall(
+        r'<input[^>]*name="([^"]*)"[^>]*type="hidden"[^>]*value="([^"]*)"',
+        consent_html
+    )
+    hidden_inputs += re.findall(
+        r'<input[^>]*value="([^"]*)"[^>]*name="([^"]*)"[^>]*type="hidden"',
+        consent_html
+    )
+    
+    for match in hidden_inputs:
+        name, value = match[0], match[1] if len(match) > 1 else ""
+        if name in ["bl", "x", "gl", "m", "app", "pc", "continue", "hl", "cm", "escs", "src"]:
+            if name not in form_data:  # Don't overwrite
+                form_data[name] = value
+    
+    # Set the "Accept all" specific values
+    form_data["set_eom"] = "false"  # Not essential-only mode
+    form_data["set_sc"] = "true"    # Set consent cookie
+    form_data["set_aps"] = "true"   # Accept personalized services
+    
+    if verbose:
+        logger.debug(f"[CONSENT] Extracted form data: {list(form_data.keys())}")
+    
+    if not form_data.get("escs"):
         if verbose:
-            logger.debug(f"[CONSENT] Following redirect to: {consent_url}")
-        
-        # Step 2: GET the consent page
-        consent_page = await client.get(consent_url)
-        
-        if consent_page.status_code != 200:
-            if verbose:
-                logger.warning(f"[CONSENT] Failed to get consent page: {consent_page.status_code}")
-            return None, cookies
-        
-        consent_html = consent_page.text
-        
-        # Extract form data from consent page
-        form_data = {}
-        
-        # Extract hidden input values using regex
-        # Pattern handles both name="x" value="y" and value="y" name="x" orders
-        hidden_inputs = re.findall(
-            r'<input[^>]*type="hidden"[^>]*name="([^"]*)"[^>]*value="([^"]*)"',
-            consent_html
-        )
-        # Also try reverse order
-        hidden_inputs += re.findall(
-            r'<input[^>]*name="([^"]*)"[^>]*type="hidden"[^>]*value="([^"]*)"',
-            consent_html
-        )
-        hidden_inputs += re.findall(
-            r'<input[^>]*value="([^"]*)"[^>]*name="([^"]*)"[^>]*type="hidden"',
-            consent_html
-        )
-        
-        for match in hidden_inputs:
-            name, value = match[0], match[1] if len(match) > 1 else ""
-            if name in ["bl", "x", "gl", "m", "app", "pc", "continue", "hl", "cm", "escs", "src"]:
-                if name not in form_data:  # Don't overwrite
-                    form_data[name] = value
-        
-        # Set the "Accept all" specific values
-        form_data["set_eom"] = "false"  # Not essential-only mode
-        form_data["set_sc"] = "true"    # Set consent cookie
-        form_data["set_aps"] = "true"   # Accept personalized services
-        
-        if verbose:
-            logger.debug(f"[CONSENT] Extracted form data: {list(form_data.keys())}")
-        
-        if not form_data.get("escs"):
-            if verbose:
-                logger.warning("[CONSENT] Could not extract consent form data (escs missing)")
-            return None, cookies
-        
-        # Step 3: POST consent acceptance
-        # Include cookies from the consent page response
-        consent_response = await client.post(
+            logger.warning("[CONSENT] Could not extract consent form data (escs missing)")
+        return None, cookies
+    
+    # POST consent acceptance using the same client (preserves cookies/session)
+    try:
+        post_response = await client.post(
             "https://consent.google.com/save",
             data=form_data,
             headers={
@@ -128,47 +98,44 @@ async def handle_consent_redirect(
         )
         
         if verbose:
-            logger.debug(f"[CONSENT] POST /save status: {consent_response.status_code}")
+            logger.debug(f"[CONSENT] POST /save status: {post_response.status_code}")
         
-        # Check for SOCS cookie in the client's cookie jar
-        socs_cookie = None
-        for cookie in client.cookies.jar:
-            if cookie.name == "SOCS":
-                socs_cookie = cookie.value
-                if verbose:
-                    logger.debug(f"[CONSENT] Found SOCS cookie: {socs_cookie[:20]}...")
-                break
+    except Exception as e:
+        if verbose:
+            logger.warning(f"[CONSENT] POST request failed: {e}")
+        return None, cookies
+    
+    # Check for SOCS cookie in the client's cookie jar
+    socs_cookie = None
+    for cookie in client.cookies.jar:
+        if cookie.name == "SOCS":
+            socs_cookie = cookie.value
+            if verbose:
+                logger.debug(f"[CONSENT] Found SOCS in cookie jar: {socs_cookie[:20]}...")
+            break
+    
+    # Also check response cookies directly
+    if not socs_cookie:
+        socs_cookie = post_response.cookies.get("SOCS")
+        if socs_cookie and verbose:
+            logger.debug(f"[CONSENT] Found SOCS in response cookies: {socs_cookie[:20]}...")
+    
+    if socs_cookie:
+        cookies["SOCS"] = socs_cookie
+        if verbose:
+            logger.info(f"[CONSENT] Successfully obtained SOCS cookie for this region")
         
-        # Also check response cookies directly
-        if not socs_cookie:
-            socs_cookie = consent_response.cookies.get("SOCS")
-            if socs_cookie and verbose:
-                logger.debug(f"[CONSENT] Found SOCS in response cookies: {socs_cookie[:20]}...")
+        # Retry Gemini with SOCS cookie now in the client's jar
+        final_response = await client.get(Endpoint.INIT.value, follow_redirects=True)
         
-        if not socs_cookie and consent_response.status_code != 200:
-            if verbose:
-                logger.warning(f"[CONSENT] POST failed ({consent_response.status_code}), no SOCS cookie")
-            return None, cookies
+        if verbose:
+            logger.debug(f"[CONSENT] Final Gemini request status: {final_response.status_code}, URL: {final_response.url}")
         
-        if socs_cookie:
-            cookies["SOCS"] = socs_cookie
-            if verbose:
-                logger.info(f"[CONSENT] Successfully obtained SOCS cookie for this region")
-            
-            # Step 4: Retry Gemini with SOCS cookie
-            # Update client cookies with SOCS
-            client.cookies.set("SOCS", socs_cookie, domain=".google.com")
-            
-            final_response = await client.get(Endpoint.INIT.value, follow_redirects=True)
-            
-            if verbose:
-                logger.debug(f"[CONSENT] Final Gemini request status: {final_response.status_code}")
-            
-            return final_response, cookies
-        else:
-            if verbose:
-                logger.warning("[CONSENT] SOCS cookie not found after consent POST")
-            return None, cookies
+        return final_response, cookies
+    else:
+        if verbose:
+            logger.warning(f"[CONSENT] SOCS cookie not found after consent POST (status: {post_response.status_code})")
+        return None, cookies
 
 
 async def send_request(
@@ -194,15 +161,16 @@ async def send_request(
             if verbose:
                 logger.info("[CONSENT] Detected consent redirect, handling automatically...")
             
-            # Handle consent in a separate flow
-            consent_response, updated_cookies = await handle_consent_redirect(
+            # Handle consent using the same client and already-loaded consent page
+            consent_result, updated_cookies = await handle_consent_redirect(
+                client=client,
+                consent_response=response,
                 cookies=cookies,
-                proxy=proxy,
                 verbose=verbose
             )
             
-            if consent_response is not None:
-                response = consent_response
+            if consent_result is not None:
+                response = consent_result
                 cookies = updated_cookies
             else:
                 if verbose:
