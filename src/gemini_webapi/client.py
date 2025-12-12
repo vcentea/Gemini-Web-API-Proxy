@@ -55,6 +55,9 @@ class GeminiClient(GemMixin):
         __Secure-1PSIDTS cookie value, some google accounts don't require this value, provide only if it's in the cookie list.
     proxy: `str`, optional
         Proxy URL.
+    extra_cookies: `dict`, optional
+        Additional cookies to include in requests (e.g., SOCS for consent in EU/GDPR regions).
+        These cookies will be merged with the authentication cookies.
     kwargs: `dict`, optional
         Additional arguments which will be passed to the http client.
         Refer to `httpx.AsyncClient` for more information.
@@ -79,6 +82,7 @@ class GeminiClient(GemMixin):
         "refresh_interval",
         "_gems",  # From GemMixin
         "kwargs",
+        "extra_cookies",
     ]
 
     def __init__(
@@ -86,6 +90,7 @@ class GeminiClient(GemMixin):
         secure_1psid: str | None = None,
         secure_1psidts: str | None = None,
         proxy: str | None = None,
+        extra_cookies: dict | None = None,
         **kwargs,
     ):
         super().__init__()
@@ -101,6 +106,10 @@ class GeminiClient(GemMixin):
         self.auto_refresh: bool = True
         self.refresh_interval: float = 540
         self.kwargs = kwargs
+
+        # Add any extra cookies first (e.g., SOCS for consent in EU regions)
+        if extra_cookies:
+            self.cookies.update(extra_cookies)
 
         if secure_1psid:
             self.cookies["__Secure-1PSID"] = secure_1psid
