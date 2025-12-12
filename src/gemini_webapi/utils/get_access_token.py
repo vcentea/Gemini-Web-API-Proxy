@@ -11,12 +11,111 @@ from ..exceptions import AuthError
 from .load_browser_cookies import load_browser_cookies
 from .logger import logger
 
+# Consent page URL pattern
+CONSENT_URL_PATTERN = re.compile(r"consent\.google\.com")
+
+
+async def handle_consent_redirect(
+    client: AsyncClient, 
+    response: Response, 
+    cookies: dict,
+    verbose: bool = False
+) -> tuple[Response, dict]:
+    """
+    Handle Google consent redirect for EU/GDPR regions.
+    
+    When accessing Gemini from certain regions (EU), Google redirects to a consent page.
+    This function programmatically accepts consent and returns the SOCS cookie.
+    
+    Parameters
+    ----------
+    client : AsyncClient
+        The httpx client to use for requests.
+    response : Response
+        The response that contains the consent page.
+    cookies : dict
+        Current cookies dict to update with SOCS.
+    verbose : bool
+        Whether to log debug information.
+        
+    Returns
+    -------
+    tuple[Response, dict]
+        The response after consent and updated cookies with SOCS.
+    """
+    consent_html = response.text
+    
+    # Extract form data from consent page
+    # Look for the "Accept all" form which has set_eom=false, set_sc=true, set_aps=true
+    form_data = {}
+    
+    # Extract hidden input values using regex
+    # Pattern: <input type="hidden" name="xxx" value="yyy">
+    hidden_inputs = re.findall(
+        r'<input[^>]*type="hidden"[^>]*name="([^"]*)"[^>]*value="([^"]*)"',
+        consent_html
+    )
+    
+    for name, value in hidden_inputs:
+        # We want the "Accept all" form values
+        if name in ["bl", "x", "gl", "m", "app", "pc", "continue", "hl", "cm", "escs"]:
+            form_data[name] = value
+    
+    # Set the "Accept all" specific values
+    form_data["set_eom"] = "false"  # Not essential-only mode
+    form_data["set_sc"] = "true"    # Set consent cookie
+    form_data["set_aps"] = "true"   # Accept personalized services
+    
+    if verbose:
+        logger.debug(f"[CONSENT] Extracted form data keys: {list(form_data.keys())}")
+    
+    if not form_data.get("escs"):
+        if verbose:
+            logger.warning("[CONSENT] Could not extract consent form data (escs missing)")
+        return response, cookies
+    
+    # POST to consent save endpoint
+    try:
+        consent_response = await client.post(
+            "https://consent.google.com/save",
+            data=form_data,
+            follow_redirects=True,
+        )
+        
+        if verbose:
+            logger.debug(f"[CONSENT] POST /save status: {consent_response.status_code}")
+        
+        # Extract SOCS cookie from response
+        socs_cookie = None
+        for cookie in client.cookies.jar:
+            if cookie.name == "SOCS":
+                socs_cookie = cookie.value
+                break
+        
+        if socs_cookie:
+            cookies["SOCS"] = socs_cookie
+            if verbose:
+                logger.info(f"[CONSENT] Successfully obtained SOCS cookie for this region")
+        else:
+            if verbose:
+                logger.warning("[CONSENT] SOCS cookie not found in consent response")
+        
+        # Now retry the original Gemini request with updated cookies
+        final_response = await client.get(Endpoint.INIT.value)
+        return final_response, cookies
+        
+    except Exception as e:
+        if verbose:
+            logger.warning(f"[CONSENT] Failed to handle consent: {e}")
+        return response, cookies
+
 
 async def send_request(
-    cookies: dict, proxy: str | None = None
+    cookies: dict, proxy: str | None = None, verbose: bool = False
 ) -> tuple[Response | None, dict]:
     """
     Send http request with provided cookies.
+    Handles consent redirect automatically for EU/GDPR regions.
     """
 
     async with AsyncClient(
@@ -27,6 +126,16 @@ async def send_request(
         verify=False,
     ) as client:
         response = await client.get(Endpoint.INIT.value)
+        
+        # Check if we were redirected to consent page
+        final_url = str(response.url)
+        if CONSENT_URL_PATTERN.search(final_url):
+            if verbose:
+                logger.info("[CONSENT] Detected consent redirect, handling automatically...")
+            response, cookies = await handle_consent_redirect(
+                client, response, cookies, verbose=verbose
+            )
+        
         response.raise_for_status()
         return response, cookies
 
@@ -76,7 +185,7 @@ async def get_access_token(
 
     # Base cookies passed directly on initializing client
     if "__Secure-1PSID" in base_cookies and "__Secure-1PSIDTS" in base_cookies:
-        tasks.append(Task(send_request({**extra_cookies, **base_cookies}, proxy=proxy)))
+        tasks.append(Task(send_request({**extra_cookies, **base_cookies}, proxy=proxy, verbose=verbose)))
     elif verbose:
         logger.debug(
             "Skipping loading base cookies. Either __Secure-1PSID or __Secure-1PSIDTS is not provided."
@@ -99,7 +208,7 @@ async def get_access_token(
                     **base_cookies,
                     "__Secure-1PSIDTS": cached_1psidts,
                 }
-                tasks.append(Task(send_request(cached_cookies, proxy=proxy)))
+                tasks.append(Task(send_request(cached_cookies, proxy=proxy, verbose=verbose)))
             elif verbose:
                 logger.debug("Skipping loading cached cookies. Cache file is empty.")
         elif verbose:
@@ -115,7 +224,7 @@ async def get_access_token(
                     "__Secure-1PSID": cache_file.stem[16:],
                     "__Secure-1PSIDTS": cached_1psidts,
                 }
-                tasks.append(Task(send_request(cached_cookies, proxy=proxy)))
+                tasks.append(Task(send_request(cached_cookies, proxy=proxy, verbose=verbose)))
                 valid_caches += 1
 
         if valid_caches == 0 and verbose:
@@ -148,7 +257,7 @@ async def get_access_token(
                         local_cookies["__Secure-1PSIDTS"] = secure_1psidts
                     if nid := cookies.get("NID"):
                         local_cookies["NID"] = nid
-                    tasks.append(Task(send_request(local_cookies, proxy=proxy)))
+                    tasks.append(Task(send_request(local_cookies, proxy=proxy, verbose=verbose)))
                     valid_browser_cookies += 1
                     if verbose:
                         logger.debug(f"Loaded local browser cookies from {browser}")
