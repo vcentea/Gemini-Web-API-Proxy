@@ -125,11 +125,25 @@ async def handle_consent_redirect(
         if verbose:
             logger.info(f"[CONSENT] Successfully obtained SOCS cookie for this region")
         
-        # Retry Gemini with SOCS cookie now in the client's jar
-        final_response = await client.get(Endpoint.INIT.value, follow_redirects=True)
+        # Explicitly set SOCS cookie on .google.com domain for the retry
+        # The cookie might have been set on consent.google.com which won't match gemini.google.com
+        client.cookies.set("SOCS", socs_cookie, domain=".google.com")
         
         if verbose:
-            logger.debug(f"[CONSENT] Final Gemini request status: {final_response.status_code}, URL: {final_response.url}")
+            logger.debug(f"[CONSENT] Set SOCS cookie on .google.com domain, retrying Gemini...")
+        
+        # Retry Gemini with SOCS cookie
+        final_response = await client.get(Endpoint.INIT.value, follow_redirects=True)
+        
+        final_url = str(final_response.url)
+        if verbose:
+            logger.debug(f"[CONSENT] Final Gemini request status: {final_response.status_code}, URL: {final_url}")
+        
+        # Check if we're still on consent page (SOCS didn't work)
+        if "consent.google.com" in final_url:
+            if verbose:
+                logger.warning(f"[CONSENT] Still redirected to consent after setting SOCS - cookie may be invalid")
+            return None, cookies
         
         return final_response, cookies
     else:
