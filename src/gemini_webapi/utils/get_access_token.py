@@ -3,8 +3,9 @@ import re
 import asyncio
 from asyncio import Task
 from pathlib import Path
+from urllib.parse import urlencode
 
-from httpx import AsyncClient, Response
+from httpx import AsyncClient, Response, Cookies
 
 from ..constants import Endpoint, Headers
 from ..exceptions import AuthError
@@ -24,178 +25,154 @@ async def handle_consent_redirect(
     """
     Handle Google consent redirect for EU/GDPR regions.
     
-    When accessing Gemini from certain regions (EU), Google redirects to a consent page.
-    This function programmatically accepts consent and returns the SOCS cookie.
+    Mimics the exact curl command that worked:
+    curl -sS -L -b "cookies" -c cookiejar -X POST consent.google.com/save --data-urlencode ...
     
-    Uses a fresh client for the POST request to avoid cookie pollution from consent page.
-    
-    Parameters
-    ----------
-    proxy : str | None
-        Proxy to use for requests.
-    consent_response : Response
-        The response containing the consent page HTML.
-    cookies : dict
-        Current cookies dict to update with SOCS.
-    verbose : bool
-        Whether to log debug information.
-        
-    Returns
-    -------
-    tuple[Response | None, dict]
-        The response after consent and updated cookies with SOCS.
+    Key: POST with auth cookies, follow redirects, collect all cookies from the chain.
     """
     consent_html = consent_response.text
     consent_url = str(consent_response.url)
     
     if verbose:
         logger.debug(f"[CONSENT] Consent page URL: {consent_url}")
-        logger.debug(f"[CONSENT] Consent HTML length: {len(consent_html)}")
     
-    # Extract form data from consent page - look for "Accept all" form
+    # Extract form data from consent page HTML
+    # Look for "Accept all" form (has set_sc=true, set_aps=true in hidden fields)
     form_data = {}
     
-    # Find the "Accept all" form specifically (has set_sc=true and set_aps=true)
-    # This regex finds forms with action="/save" or action="https://consent.google.com/save"
-    accept_form_match = re.search(
-        r'<form[^>]*action="[^"]*consent\.google\.com/save"[^>]*>(.*?)</form>',
-        consent_html,
-        re.DOTALL | re.IGNORECASE
-    )
-    
-    if not accept_form_match:
-        # Try simpler pattern
-        accept_form_match = re.search(
-            r'<form[^>]*action="[^"]*save"[^>]*>(.*?)</form>',
-            consent_html,
-            re.DOTALL | re.IGNORECASE
-        )
-    
-    form_html = accept_form_match.group(1) if accept_form_match else consent_html
-    
-    # Extract ALL hidden input values - simpler approach
-    hidden_pattern = re.compile(r'<input[^>]*type="hidden"[^>]*>', re.IGNORECASE)
-    for input_tag in hidden_pattern.findall(form_html):
-        name_match = re.search(r'name="([^"]*)"', input_tag)
-        value_match = re.search(r'value="([^"]*)"', input_tag)
-        if name_match and value_match:
+    # Find ALL hidden inputs in the page
+    # Pattern: <input type="hidden" name="X" value="Y"> (order may vary)
+    for match in re.finditer(r'<input[^>]+>', consent_html, re.IGNORECASE):
+        tag = match.group(0)
+        if 'type="hidden"' not in tag.lower() and "type='hidden'" not in tag.lower():
+            continue
+        name_match = re.search(r'name=["\']([^"\']+)["\']', tag)
+        value_match = re.search(r'value=["\']([^"\']*)["\']', tag)
+        if name_match:
             name = name_match.group(1)
-            value = value_match.group(1)
-            form_data[name] = value
+            value = value_match.group(1) if value_match else ""
+            # Only keep relevant form fields (avoid duplicates from multiple forms)
+            if name not in form_data:
+                form_data[name] = value
     
-    # Set the "Accept all" specific values (override if present)
-    form_data["set_eom"] = "false"  # Not essential-only mode
-    form_data["set_sc"] = "true"    # Set consent cookie
-    form_data["set_aps"] = "true"   # Accept personalized services
+    # Ensure "Accept all" values are set
+    form_data["set_eom"] = "false"
+    form_data["set_sc"] = "true"
+    form_data["set_aps"] = "true"
     
     if verbose:
-        logger.debug(f"[CONSENT] Extracted form data: {form_data}")
+        logger.debug(f"[CONSENT] Form fields: {list(form_data.keys())}")
     
     if not form_data.get("escs"):
         if verbose:
-            logger.warning("[CONSENT] Could not extract consent form data (escs missing)")
-            # Try to find escs anywhere in the page
-            escs_match = re.search(r'name="escs"\s+value="([^"]*)"', consent_html)
-            if escs_match:
-                form_data["escs"] = escs_match.group(1)
-                logger.debug(f"[CONSENT] Found escs via fallback: {form_data['escs'][:20]}...")
-            else:
-                return None, cookies
+            logger.warning("[CONSENT] Missing escs token - cannot submit consent")
+        return None, cookies
     
-    # POST consent acceptance using a FRESH client
-    # This mimics what curl does - doesn't carry consent page cookies
+    # Build form body exactly like curl --data-urlencode
+    form_body = urlencode(form_data)
+    
+    if verbose:
+        logger.debug(f"[CONSENT] POST body length: {len(form_body)}")
+    
+    # POST to consent.google.com/save - exactly like curl
+    # Key: Use ONLY the original auth cookies (PSID, PSIDTS), follow redirects
     try:
         async with AsyncClient(
             proxy=proxy,
-            headers=Headers.GEMINI.value,
-            cookies=cookies,  # Only include original auth cookies
-            follow_redirects=True,  # Follow redirects like curl -L
+            follow_redirects=True,
             verify=False,
-        ) as post_client:
-            if verbose:
-                logger.debug(f"[CONSENT] POSTing to consent.google.com/save with form data")
+            timeout=30.0,
+        ) as client:
+            # Set cookies exactly like curl -b "name=value; name2=value2"
+            for name, value in cookies.items():
+                if name.startswith("__Secure-") or name in ["SOCS", "NID", "AEC"]:
+                    client.cookies.set(name, value, domain=".google.com")
             
-            post_response = await post_client.post(
+            if verbose:
+                logger.debug(f"[CONSENT] Cookies being sent: {list(client.cookies.keys())}")
+            
+            # POST with headers matching curl
+            response = await client.post(
                 "https://consent.google.com/save",
-                data=form_data,
+                content=form_body,
                 headers={
+                    **Headers.GEMINI.value,
                     "Content-Type": "application/x-www-form-urlencoded",
                     "Origin": "https://consent.google.com",
                     "Referer": consent_url,
                 },
             )
             
+            final_url = str(response.url)
             if verbose:
-                logger.debug(f"[CONSENT] POST final status: {post_response.status_code}, URL: {post_response.url}")
+                logger.debug(f"[CONSENT] POST chain ended at: {response.status_code} {final_url}")
             
-            # Collect ALL cookies from the cookie jar after following redirects
-            all_consent_cookies = {}
-            for cookie in post_client.cookies.jar:
-                all_consent_cookies[cookie.name] = cookie.value
+            # Collect ALL cookies from the entire redirect chain
+            all_cookies = {}
+            for cookie in client.cookies.jar:
+                all_cookies[cookie.name] = cookie.value
+            
+            if verbose:
+                logger.debug(f"[CONSENT] Cookies after POST chain: {list(all_cookies.keys())}")
+            
+            # Check if we got SOCS
+            if "SOCS" in all_cookies:
                 if verbose:
-                    logger.debug(f"[CONSENT] Cookie after POST: {cookie.name}={cookie.value[:20] if len(cookie.value) > 20 else cookie.value}...")
-            
+                    logger.info(f"[CONSENT] Got SOCS: {all_cookies['SOCS'][:20]}...")
+                
+                # Merge with original cookies
+                merged = {**cookies, **all_cookies}
+                
+                # Check if we ended up at Gemini successfully
+                if "gemini.google.com" in final_url and response.status_code == 200:
+                    if verbose:
+                        logger.info("[CONSENT] SUCCESS - ended at Gemini after consent")
+                    return response, merged
+                
+                # If we're still at consent or got redirected elsewhere, 
+                # try one more request to Gemini with all cookies
+                if "consent.google.com" in final_url or response.status_code != 200:
+                    if verbose:
+                        logger.debug("[CONSENT] Making final Gemini request with merged cookies")
+                    
+                    # Reset cookies and try Gemini
+                    client.cookies.clear()
+                    for name, value in merged.items():
+                        if isinstance(value, str):
+                            client.cookies.set(name, value, domain=".google.com")
+                    
+                    gemini_response = await client.get(
+                        Endpoint.INIT.value,
+                        headers=Headers.GEMINI.value,
+                    )
+                    
+                    gemini_url = str(gemini_response.url)
+                    if verbose:
+                        logger.debug(f"[CONSENT] Gemini response: {gemini_response.status_code} {gemini_url}")
+                    
+                    # Collect any new cookies
+                    for cookie in client.cookies.jar:
+                        if cookie.name not in merged:
+                            merged[cookie.name] = cookie.value
+                    
+                    if "gemini.google.com" in gemini_url and gemini_response.status_code == 200:
+                        return gemini_response, merged
+                    
+                    if "CookieMismatch" in gemini_url:
+                        if verbose:
+                            logger.warning("[CONSENT] CookieMismatch - location mismatch detected")
+                    
+                    return None, merged
+                
+                return response, merged
+            else:
+                if verbose:
+                    logger.warning(f"[CONSENT] No SOCS cookie received")
+                return None, cookies
+                
     except Exception as e:
         if verbose:
-            logger.warning(f"[CONSENT] POST request failed: {e}")
-        return None, cookies
-    
-    # Check if we got SOCS
-    socs_cookie = all_consent_cookies.get("SOCS")
-    
-    if verbose:
-        logger.debug(f"[CONSENT] All cookies after POST chain: {list(all_consent_cookies.keys())}")
-        logger.debug(f"[CONSENT] SOCS cookie: {socs_cookie[:20] if socs_cookie else 'NOT FOUND'}...")
-    
-    if socs_cookie:
-        if verbose:
-            logger.info(f"[CONSENT] Successfully obtained SOCS cookie: {socs_cookie[:20]}...")
-        
-        # Merge all consent cookies with original cookies
-        merged_cookies = {**cookies, **all_consent_cookies}
-        
-        if verbose:
-            logger.debug(f"[CONSENT] Merged cookies: {list(merged_cookies.keys())}")
-        
-        # Now retry Gemini with ALL cookies (original + consent)
-        async with AsyncClient(
-            proxy=proxy,
-            headers=Headers.GEMINI.value,
-            cookies=merged_cookies,
-            follow_redirects=True,
-            verify=False,
-        ) as final_client:
-            final_response = await final_client.get(Endpoint.INIT.value)
-            
-            final_url = str(final_response.url)
-            if verbose:
-                logger.debug(f"[CONSENT] Final Gemini request status: {final_response.status_code}, URL: {final_url}")
-            
-            # Collect any additional cookies from final request
-            for cookie in final_client.cookies.jar:
-                if cookie.name not in merged_cookies:
-                    merged_cookies[cookie.name] = cookie.value
-                    if verbose:
-                        logger.debug(f"[CONSENT] New cookie from final request: {cookie.name}")
-            
-            # Check for various failure conditions
-            if "consent.google.com" in final_url:
-                if verbose:
-                    logger.warning(f"[CONSENT] Still redirected to consent after using all cookies")
-                return None, merged_cookies
-            
-            if "CookieMismatch" in final_url or "accounts.google.com" in final_url:
-                if verbose:
-                    logger.warning(f"[CONSENT] Cookie mismatch detected - session may be from different location")
-                # Return merged cookies anyway - they might work for future requests
-                return None, merged_cookies
-            
-            # Success! Return the response and merged cookies
-            return final_response, merged_cookies
-    else:
-        if verbose:
-            logger.warning(f"[CONSENT] SOCS cookie not found after consent POST")
-            logger.debug(f"[CONSENT] Available cookies: {list(all_consent_cookies.keys())}")
+            logger.error(f"[CONSENT] Error: {e}")
         return None, cookies
 
 
