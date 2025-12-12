@@ -84,42 +84,44 @@ async def handle_consent_redirect(
             logger.warning("[CONSENT] Could not extract consent form data (escs missing)")
         return None, cookies
     
-    # POST consent acceptance - use a fresh client to avoid cookie conflicts
-    # This mimics the curl approach that worked
+    # POST consent acceptance using the SAME client that loaded the consent page
+    # This is important because the consent page may have set cookies we need
     try:
-        async with AsyncClient(
-            headers=Headers.GEMINI.value,
-            cookies=cookies,  # Start with original auth cookies
-            follow_redirects=True,
-            verify=False,
-        ) as consent_client:
-            post_response = await consent_client.post(
-                "https://consent.google.com/save",
-                data=form_data,
-                headers={
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "Origin": "https://consent.google.com",
-                    "Referer": consent_url,
-                },
-            )
-            
+        # First, collect cookies that were set when loading the consent page
+        consent_page_cookies = {}
+        for cookie in client.cookies.jar:
+            consent_page_cookies[cookie.name] = cookie.value
             if verbose:
-                logger.debug(f"[CONSENT] POST /save status: {post_response.status_code}")
-                logger.debug(f"[CONSENT] POST /save final URL: {post_response.url}")
-            
-            # Collect ALL cookies from the consent client's jar
-            all_consent_cookies = {}
-            for cookie in consent_client.cookies.jar:
-                all_consent_cookies[cookie.name] = cookie.value
-                if verbose:
-                    logger.debug(f"[CONSENT] Cookie from consent: {cookie.name}={cookie.value[:20] if len(cookie.value) > 20 else cookie.value}...")
-            
-            # Also check response cookies
-            for name, value in post_response.cookies.items():
-                if name not in all_consent_cookies:
-                    all_consent_cookies[name] = value
-                    if verbose:
-                        logger.debug(f"[CONSENT] Cookie from response: {name}={value[:20] if len(value) > 20 else value}...")
+                logger.debug(f"[CONSENT] Cookie from consent page: {cookie.name}={cookie.value[:20] if len(cookie.value) > 20 else cookie.value}...")
+        
+        # POST to consent/save using the same client (has consent page cookies)
+        post_response = await client.post(
+            "https://consent.google.com/save",
+            data=form_data,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Origin": "https://consent.google.com",
+                "Referer": consent_url,
+            },
+            follow_redirects=False,  # Don't follow - we want to see the redirect
+        )
+        
+        if verbose:
+            logger.debug(f"[CONSENT] POST /save status: {post_response.status_code}")
+            logger.debug(f"[CONSENT] POST /save headers: {dict(post_response.headers)}")
+        
+        # Collect ALL cookies after POST (from client jar + response)
+        all_consent_cookies = {}
+        for cookie in client.cookies.jar:
+            all_consent_cookies[cookie.name] = cookie.value
+        
+        for name, value in post_response.cookies.items():
+            all_consent_cookies[name] = value
+            if verbose:
+                logger.debug(f"[CONSENT] New cookie from POST: {name}={value[:20] if len(value) > 20 else value}...")
+        
+        if verbose:
+            logger.debug(f"[CONSENT] All cookies after POST: {list(all_consent_cookies.keys())}")
         
     except Exception as e:
         if verbose:
@@ -134,33 +136,30 @@ async def handle_consent_redirect(
             logger.info(f"[CONSENT] Successfully obtained SOCS cookie: {socs_cookie[:20]}...")
         
         # Merge all consent cookies with original cookies
-        # This ensures we have everything needed for the retry
         merged_cookies = {**cookies, **all_consent_cookies}
         
         if verbose:
             logger.debug(f"[CONSENT] Merged cookies: {list(merged_cookies.keys())}")
         
-        # Retry Gemini with ALL cookies from consent
-        async with AsyncClient(
-            headers=Headers.GEMINI.value,
-            cookies=merged_cookies,
-            follow_redirects=True,
-            verify=False,
-        ) as retry_client:
-            final_response = await retry_client.get(Endpoint.INIT.value)
-            
-            final_url = str(final_response.url)
+        # Set all consent cookies on the client for the retry
+        for name, value in all_consent_cookies.items():
+            client.cookies.set(name, value, domain=".google.com")
+        
+        # Retry Gemini with the same client (now has all consent cookies)
+        final_response = await client.get(Endpoint.INIT.value, follow_redirects=True)
+        
+        final_url = str(final_response.url)
+        if verbose:
+            logger.debug(f"[CONSENT] Final Gemini request status: {final_response.status_code}, URL: {final_url}")
+        
+        # Check if we're still on consent page
+        if "consent.google.com" in final_url:
             if verbose:
-                logger.debug(f"[CONSENT] Final Gemini request status: {final_response.status_code}, URL: {final_url}")
-            
-            # Check if we're still on consent page
-            if "consent.google.com" in final_url:
-                if verbose:
-                    logger.warning(f"[CONSENT] Still redirected to consent after using all cookies")
-                return None, cookies
-            
-            # Success! Return the response and merged cookies
-            return final_response, merged_cookies
+                logger.warning(f"[CONSENT] Still redirected to consent after using all cookies")
+            return None, cookies
+        
+        # Success! Return the response and merged cookies
+        return final_response, merged_cookies
     else:
         if verbose:
             logger.warning(f"[CONSENT] SOCS cookie not found after consent POST")
