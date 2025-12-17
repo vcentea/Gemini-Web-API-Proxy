@@ -83,6 +83,7 @@ class GeminiClient(GemMixin):
         "_gems",  # From GemMixin
         "kwargs",
         "extra_cookies",
+        "_last_response_text",  # CUSTOM FIX: Store last response for "Loading..." detection
     ]
 
     def __init__(
@@ -106,6 +107,7 @@ class GeminiClient(GemMixin):
         self.auto_refresh: bool = True
         self.refresh_interval: float = 540
         self.kwargs = kwargs
+        self._last_response_text: str = ""  # CUSTOM FIX: Store last response for "Loading..." detection
 
         # Add any extra cookies first (e.g., SOCS for consent in EU regions)
         if extra_cookies:
@@ -413,6 +415,8 @@ class GeminiClient(GemMixin):
                     raise
                 except Exception:
                     logger.debug(f"Invalid response: {response.text}")
+                    # CUSTOM FIX: Store response text for decorator to check for "Loading..." status
+                    self._last_response_text = response.text
                     raise APIError(
                         "Failed to generate contents. Invalid response data received. Client will try to re-initialize on next request."
                     )
