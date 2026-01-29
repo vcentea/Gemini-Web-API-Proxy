@@ -38,19 +38,36 @@ def running(retry: int = 0) -> Callable:
                 else:
                     return await func(client, *args, **kwargs)
             except APIError as e:
-                # CUSTOM FIX: Handle "Loading..." status messages from image generation
-                # These are not errors - they mean the image is still being generated
-                is_loading_status = (
-                    "Invalid response data received" in str(e) and 
-                    hasattr(client, '_last_response_text') and 
-                    "Loading" in client._last_response_text
+                # CUSTOM FIX: Handle intermediate status responses from Gemini
+                # When Gemini is "thinking" or "generating", it returns status-only responses
+                # like [["wrb.fr",null,null,null,null,[2]]] or [["wrb.fr",null,null,null,null,[4]]]
+                # Status codes:
+                #   [2] = "Thinking in progress" (extended thinking/reasoning models)
+                #   [4] = "Generating in progress" (model is writing response)
+                last_response = getattr(client, '_last_response_text', '')
+
+                is_thinking_status = (
+                    "Invalid response data received" in str(e) and
+                    last_response and
+                    ('null,null,null,[2]' in last_response or 'null,null,null,[4]' in last_response)
                 )
-                
+
+                is_loading_status = (
+                    "Invalid response data received" in str(e) and
+                    last_response and
+                    "Loading" in last_response
+                )
+
                 # Image generation takes longer and needs more retries
                 if isinstance(e, ImageGenerationError):
                     # Allow up to 3 retries for image generation (was limited to 1)
                     retry = min(3, retry)
                     wait_time = 15  # Wait 15 seconds between retries for images
+                elif is_thinking_status:
+                    # Thinking/Generating in progress - model is processing
+                    # This is common for models like gemini-3.0-pro that do extended thinking
+                    retry = min(10, max(retry, 10))  # Allow up to 10 retries
+                    wait_time = 5  # Wait 5 seconds between retries (total ~50s wait capacity)
                 elif is_loading_status:
                     # "Loading..." status - image is being generated, wait longer
                     retry = min(5, retry)  # Allow up to 5 retries for loading status
